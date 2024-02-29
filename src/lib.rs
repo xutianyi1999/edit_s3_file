@@ -7,11 +7,9 @@ use anyhow::{anyhow, ensure, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, SharedCredentialsProvider};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, CopyPartResult};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_types::region::Region;
 use aws_types::SdkConfig;
-use futures_util::future::BoxFuture;
-use futures_util::FutureExt;
 use serde::Deserialize;
 use tokio::runtime::Runtime;
 
@@ -97,29 +95,27 @@ pub fn modify(
 
         let mut part_num = 1;
         let mut offset = 0;
-        let mut futures: Vec<BoxFuture<_>> = Vec::new();
+        let mut etags = Vec::new();
 
         while offset < obj_len {
+            println!("part_num: {}", part_num);
             let mut end;
 
             if offset == modify_part.index {
                 end = modify_part.index + modify_part_len;
 
-                let fut = client.upload_part()
+                let etag = client.upload_part()
                     .bucket(bucket)
                     .key(key)
                     .upload_id(upload_id)
                     .part_number(part_num)
                     .body(ByteStream::from(modify_part.data.take().unwrap()))
                     .send()
-                    .map(|res| {
-                        let out = res?;
-                        out.e_tag()
-                            .map(String::from)
-                            .ok_or_else(|| anyhow!("{} must need e_tag", key))
-                    });
+                    .await?
+                    .e_tag
+                    .ok_or_else(|| anyhow!("{} must need e_tag", key))?;
 
-                futures.push(Box::pin(fut));
+                etags.push(etag);
             } else {
                 end = std::cmp::min(offset + PART_SIZE, obj_len);
 
@@ -128,7 +124,7 @@ pub fn modify(
                     end = modify_part.index;
                 }
 
-                let fut = client.upload_part_copy()
+                let etag = client.upload_part_copy()
                     .copy_source(format!("/{}/{}", bucket, key))
                     .copy_source_range(format!("bytes={}-{}", offset, end - 1))
                     .bucket(bucket)
@@ -136,24 +132,20 @@ pub fn modify(
                     .upload_id(upload_id)
                     .part_number(part_num)
                     .send()
-                    .map(|res| {
-                        let out = res?;
-                        let cpr: CopyPartResult = out.copy_part_result.ok_or_else(|| anyhow!("{} must need copy part result", key))?;
-                        cpr.e_tag()
-                            .map(String::from)
-                            .ok_or_else(|| anyhow!("{} must need e_tag", key))
-                    });
+                    .await?
+                    .copy_part_result
+                    .ok_or_else(|| anyhow!("{} must need copy part result", key))?
+                    .e_tag
+                    .ok_or_else(|| anyhow!("{} must need e_tag", key))?;
 
-                futures.push(Box::pin(fut));
+                etags.push(etag);
             }
 
             offset = end;
             part_num += 1;
         }
 
-        let out_list = futures_util::future::try_join_all(futures).await?;
-
-        let parts = out_list.into_iter()
+        let parts = etags.into_iter()
             .enumerate()
             .map(|(i, e_tag)| {
                 CompletedPart::builder()
