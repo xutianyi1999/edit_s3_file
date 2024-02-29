@@ -60,7 +60,7 @@ pub fn modify(
 
         let mut builder = SdkConfig::builder()
             .endpoint_url(config.endpoint)
-            .region(config.region.map(Region::new));
+            .region(Region::new(config.region));
 
         if let (Some(ak), Some(sk)) = (config.access_key, config.secret_key) {
             builder = builder.credentials_provider(SharedCredentialsProvider::new(Credentials::new(
