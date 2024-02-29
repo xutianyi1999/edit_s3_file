@@ -33,7 +33,7 @@ impl Part {
 pub struct S3Config {
     pub endpoint: String,
     pub bucket: String,
-    pub region: Option<String>,
+    pub region: String,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
 }
