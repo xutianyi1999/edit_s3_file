@@ -55,7 +55,7 @@ pub fn modify(
                 "Static",
             )))
         }
-        Ok((config.bucket, Client::new(&builder.build())))
+        Result::<_, anyhow::Error>::Ok((config.bucket, Client::new(&builder.build())))
     })?;
 
     RT.block_on(async {
