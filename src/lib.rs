@@ -98,11 +98,12 @@ pub fn modify(
         let mut etags = Vec::new();
 
         while offset < obj_len {
-            println!("part_num: {}", part_num);
             let mut end;
 
             if offset == modify_part.index {
                 end = modify_part.index + modify_part_len;
+
+                println!("upload, part_num: {}", part_num);
 
                 let etag = client.upload_part()
                     .bucket(bucket)
@@ -123,6 +124,8 @@ pub fn modify(
                     modify_part.index < end {
                     end = modify_part.index;
                 }
+
+                println!("copy, part_num: {}, range: {}-{}", part_num, offset, end -1);
 
                 let etag = client.upload_part_copy()
                     .copy_source(format!("/{}/{}", bucket, key))
