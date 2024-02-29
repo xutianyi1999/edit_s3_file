@@ -2,17 +2,31 @@
 #![feature(lazy_cell)]
 
 use std::sync::{LazyLock, OnceLock};
+
+use anyhow::{anyhow, ensure, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, SharedCredentialsProvider};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, CopyPartResult};
 use aws_types::region::Region;
 use aws_types::SdkConfig;
+use futures_util::future::BoxFuture;
+use futures_util::FutureExt;
 use serde::Deserialize;
-use anyhow::Result;
 use tokio::runtime::Runtime;
 
-pub struct Part<'a> {
-    index: u64,
-    data: &'a [u8],
+pub struct Part {
+    index: i64,
+    data: Option<Vec<u8>>,
+}
+
+impl Part {
+    pub fn new(index: i64, data: Vec<u8>) -> Self {
+        Part {
+            index,
+            data: Some(data),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -25,6 +39,8 @@ pub struct S3Config {
 }
 
 pub const PATH_ENV: &'static str = "S3_STORE_CONFIG";
+// 1GB
+const PART_SIZE: i64 = 1024 * 1024 * 1024;
 static CLIENT: OnceLock<(String, Client)> = OnceLock::new();
 
 static RT: LazyLock<Runtime> = LazyLock::new(|| {
@@ -36,7 +52,7 @@ static RT: LazyLock<Runtime> = LazyLock::new(|| {
 
 pub fn modify(
     key: &str,
-    parts: &[Part],
+    mut modify_part: Part,
 ) -> Result<()> {
     let (bucket, client) = CLIENT.get_or_try_init(|| {
         let path = std::env::var(PATH_ENV)?;
@@ -59,17 +75,106 @@ pub fn modify(
     })?;
 
     RT.block_on(async {
-        let parts = client.list_parts()
+        let obj = client.get_object()
             .bucket(bucket)
             .key(key)
             .send()
             .await?;
 
-        let parts = parts.parts.unwrap();
+        let obj_len = obj.content_length().ok_or_else(|| anyhow!("{} content length is empty", key))?;
+        let modify_part_len = modify_part.data.as_ref().unwrap().len() as i64;
+        ensure!(modify_part.index + modify_part_len <= obj_len);
 
-        for part in parts {
-            println!("num: {:?}, size: {:?}", part.part_number, part.size)
+        let upload_out = client.create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?;
+
+        let upload_id = upload_out
+            .upload_id()
+            .ok_or_else(|| anyhow!("{}, must need upload id", key))?;
+
+        let mut part_num = 1;
+        let mut offset = 0;
+        let mut futures: Vec<BoxFuture<_>> = Vec::new();
+
+        while offset < obj_len {
+            let mut end;
+
+            if offset == modify_part.index {
+                end = modify_part.index + modify_part_len;
+
+                let fut = client.upload_part()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_num)
+                    .body(ByteStream::from(modify_part.data.take().unwrap()))
+                    .send()
+                    .map(|res| {
+                        let out = res?;
+                        out.e_tag()
+                            .map(String::from)
+                            .ok_or_else(|| anyhow!("{} must need e_tag", key))
+                    });
+
+                futures.push(Box::pin(fut));
+            } else {
+                end = std::cmp::min(offset + PART_SIZE, obj_len);
+
+                if modify_part.index > offset &&
+                    modify_part.index < end {
+                    end = modify_part.index;
+                }
+
+                let fut = client.upload_part_copy()
+                    .copy_source(format!("/{}/{}", bucket, key))
+                    .copy_source_range(format!("bytes={}-{}", offset, end - 1))
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_num)
+                    .send()
+                    .map(|res| {
+                        let out = res?;
+                        let cpr: CopyPartResult = out.copy_part_result.ok_or_else(|| anyhow!("{} must need copy part result", key))?;
+                        cpr.e_tag()
+                            .map(String::from)
+                            .ok_or_else(|| anyhow!("{} must need e_tag", key))
+                    });
+
+                futures.push(Box::pin(fut));
+            }
+
+            offset = end;
+            part_num += 1;
         }
+
+        let out_list = futures_util::future::try_join_all(futures).await?;
+
+        let parts = out_list.into_iter()
+            .enumerate()
+            .map(|(i, e_tag)| {
+                CompletedPart::builder()
+                    .part_number(i as i32 + 1)
+                    .e_tag(e_tag)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+
+        client.complete_multipart_upload()
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await?;
+
         Ok(())
     })
 }
